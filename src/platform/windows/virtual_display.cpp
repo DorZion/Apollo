@@ -665,6 +665,14 @@ std::wstring createVirtualDisplay(
 		return std::wstring();
 	}
 
+	std::wstring reconnectedName = reconnectVirtualDisplay(guid);
+	if (!reconnectedName.empty()) {
+		printf("[SUDOVDA] Reconnected existing display, updating settings...\n");
+		changeDisplaySettings(reconnectedName.c_str(), width, height, fps);
+		printf("[SUDOVDA] Configuration: W: %d, H: %d, FPS: %d\n", width, height, fps);
+		return reconnectedName;
+	}
+
 	VIRTUAL_DISPLAY_ADD_OUT output;
 	if (!AddVirtualDisplay(SUDOVDA_DRIVER_HANDLE, width, height, fps, guid, s_client_name, s_client_uid, output)) {
 		printf("[SUDOVDA] Failed to add virtual display.\n");
@@ -699,6 +707,44 @@ bool removeVirtualDisplay(const GUID& guid) {
 	} else {
 		return false;
 	}
+}
+
+bool disconnectVirtualDisplay(const GUID& guid) {
+	if (SUDOVDA_DRIVER_HANDLE == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+
+	if (DisconnectVirtualDisplay(SUDOVDA_DRIVER_HANDLE, guid)) {
+		printf("[SUDOVDA] Virtual display disconnected successfully.\n");
+		return true;
+	} else {
+		return false;
+	}
+}
+
+std::wstring reconnectVirtualDisplay(const GUID& guid) {
+	if (SUDOVDA_DRIVER_HANDLE == INVALID_HANDLE_VALUE) {
+		return std::wstring();
+	}
+
+	VIRTUAL_DISPLAY_RECONNECT_OUT output;
+	if (!ReconnectVirtualDisplay(SUDOVDA_DRIVER_HANDLE, guid, output)) {
+		return std::wstring();
+	}
+
+	uint32_t retryInterval = 20;
+	wchar_t deviceName[CCHDEVICENAME]{};
+	while (!GetAddedDisplayName(output, deviceName)) {
+		Sleep(retryInterval);
+		if (retryInterval > 320) {
+			printf("[SUDOVDA] Cannot get name for reconnected virtual display!\n");
+			return std::wstring();
+		}
+		retryInterval *= 2;
+	}
+
+	wprintf(L"[SUDOVDA] Virtual display reconnected successfully: %ls\n", deviceName);
+	return std::wstring(deviceName);
 }
 
 // START ISOLATED DISPLAY METHODS

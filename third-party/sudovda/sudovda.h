@@ -106,6 +106,48 @@ static const bool RemoveVirtualDisplay(HANDLE hDevice, const GUID& MonitorGuid) 
 	return success;
 }
 
+static const bool DisconnectVirtualDisplay(HANDLE hDevice, const GUID& MonitorGuid) {
+	VIRTUAL_DISPLAY_DISCONNECT_PARAMS params{MonitorGuid};
+	DWORD bytesReturned;
+	BOOL success = DeviceIoControl(
+		hDevice,
+		IOCTL_DISCONNECT_VIRTUAL_DISPLAY,
+		(LPVOID)&params,
+		sizeof(params),
+		nullptr,
+		0,
+		&bytesReturned,
+		nullptr
+	);
+
+	if (!success) {
+		std::cerr << "[SUVDA] DisconnectVirtualDisplay failed: " << GetLastError() << std::endl;
+	}
+
+	return success;
+}
+
+static const bool ReconnectVirtualDisplay(HANDLE hDevice, const GUID& MonitorGuid, VIRTUAL_DISPLAY_RECONNECT_OUT& output) {
+	VIRTUAL_DISPLAY_RECONNECT_PARAMS params{MonitorGuid};
+	DWORD bytesReturned;
+	BOOL success = DeviceIoControl(
+		hDevice,
+		IOCTL_RECONNECT_VIRTUAL_DISPLAY,
+		(LPVOID)&params,
+		sizeof(params),
+		(LPVOID)&output,
+		sizeof(output),
+		&bytesReturned,
+		nullptr
+	);
+
+	if (!success) {
+		std::cerr << "[SUVDA] ReconnectVirtualDisplay failed: " << GetLastError() << std::endl;
+	}
+
+	return success;
+}
+
 static const bool SetRenderAdapter(HANDLE hDevice, const LUID& AdapterLuid) {
 	VIRTUAL_DISPLAY_SET_RENDER_ADAPTER_PARAMS params{AdapterLuid};
 	DWORD bytesReturned;
@@ -244,6 +286,14 @@ static const bool GetAddedDisplayName(const VIRTUAL_DISPLAY_ADD_OUT& addedDispla
 	wcscpy_s(deviceName, CCHDEVICENAME, sourceName.viewGdiDeviceName);
 
 	return true;
+}
+
+// Overload for reconnected displays (RECONNECT_OUT has identical AdapterLuid/TargetId fields)
+static const bool GetAddedDisplayName(const VIRTUAL_DISPLAY_RECONNECT_OUT& reconnectedDisplay, wchar_t* deviceName) {
+	VIRTUAL_DISPLAY_ADD_OUT addOut;
+	addOut.AdapterLuid = reconnectedDisplay.AdapterLuid;
+	addOut.TargetId = reconnectedDisplay.TargetId;
+	return GetAddedDisplayName(addOut, deviceName);
 }
 
 #ifdef __cplusplus

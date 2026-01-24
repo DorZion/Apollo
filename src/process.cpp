@@ -758,12 +758,16 @@ namespace proc {
 
     bool used_virtual_display = vDisplayDriverStatus == VDISPLAY::DRIVER_STATUS::OK && _launch_session && _launch_session->virtual_display;
     if (used_virtual_display) {
-      if (VDISPLAY::removeVirtualDisplay(_launch_session->display_guid)) {
-        BOOST_LOG(info) << "Virtual Display removed successfully";
-      } else if (this->virtual_display) {
-        BOOST_LOG(warning) << "Virtual Display remove failed";
+      if (VDISPLAY::disconnectVirtualDisplay(_launch_session->display_guid)) {
+        BOOST_LOG(info) << "Virtual Display disconnected (available for reconnect)";
       } else {
-        BOOST_LOG(warning) << "Virtual Display remove failed, but it seems it was not created correctly either.";
+        if (VDISPLAY::removeVirtualDisplay(_launch_session->display_guid)) {
+          BOOST_LOG(info) << "Virtual Display removed (disconnect failed, used remove)";
+        } else if (this->virtual_display) {
+          BOOST_LOG(warning) << "Virtual Display cleanup failed";
+        } else {
+          BOOST_LOG(warning) << "Virtual Display cleanup failed, but it seems it was not created correctly either.";
+        }
       }
     }
 

@@ -43,6 +43,8 @@ namespace VDISPLAY {
 		const GUID& guid
 	);
 	bool removeVirtualDisplay(const GUID& guid);
+	bool disconnectVirtualDisplay(const GUID& guid);
+	std::wstring reconnectVirtualDisplay(const GUID& guid);
 
 	std::vector<std::wstring> matchDisplay(std::wstring sMatch);
 }
