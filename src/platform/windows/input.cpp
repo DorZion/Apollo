@@ -53,14 +53,8 @@ namespace platf {
     void *userdata
   );
 
-  void CALLBACK ds4_notify(
-    client_t::pointer client,
-    target_t::pointer target,
-    std::uint8_t largeMotor,
-    std::uint8_t smallMotor,
-    DS4_LIGHTBAR_COLOR /* led_color */,
-    void *userdata
-  );
+  class vigem_t;
+  void ds4_output_report_thread(vigem_t *vigem, int gamepad_index);
 
   struct gp_touch_context_t {
     uint8_t pointerIndex;
@@ -88,6 +82,10 @@ namespace platf {
 
     gamepad_feedback_msg_t last_rumble;
     gamepad_feedback_msg_t last_rgb_led;
+
+    // DS4 raw output report polling thread (workaround for ViGEmBus #80)
+    std::thread ds4_feedback_thread;
+    HANDLE ds4_feedback_stop_event = nullptr;
   };
 
   constexpr float EARTH_G = 9.80665f;
@@ -273,12 +271,13 @@ namespace platf {
 
       if (gp_type == Xbox360Wired) {
         status = vigem_target_x360_register_notification(client.get(), gamepad.gp.get(), x360_notify, this);
+        if (!VIGEM_SUCCESS(status)) {
+          BOOST_LOG(warning) << "Couldn't register X360 rumble notifications ["sv << util::hex(status).to_string_view() << ']';
+        }
       } else {
-        status = vigem_target_ds4_register_notification(client.get(), gamepad.gp.get(), ds4_notify, this);
-      }
-
-      if (!VIGEM_SUCCESS(status)) {
-        BOOST_LOG(warning) << "Couldn't register notifications for rumble support ["sv << util::hex(status).to_string_view() << ']';
+        // Use raw output report API instead of register_notification (ViGEmBus #80)
+        gamepad.ds4_feedback_stop_event = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        gamepad.ds4_feedback_thread = std::thread(ds4_output_report_thread, this, id.globalIndex);
       }
 
       return 0;
@@ -294,6 +293,16 @@ namespace platf {
       if (gamepad.repeat_task) {
         task_pool.cancel(gamepad.repeat_task);
         gamepad.repeat_task = 0;
+      }
+
+      // Stop the DS4 output report polling thread before removing the target
+      if (gamepad.ds4_feedback_stop_event) {
+        SetEvent(gamepad.ds4_feedback_stop_event);
+        if (gamepad.ds4_feedback_thread.joinable()) {
+          gamepad.ds4_feedback_thread.join();
+        }
+        CloseHandle(gamepad.ds4_feedback_stop_event);
+        gamepad.ds4_feedback_stop_event = nullptr;
       }
 
       if (gamepad.gp && vigem_target_is_attached(gamepad.gp.get())) {
@@ -389,6 +398,16 @@ namespace platf {
     ~vigem_t() {
       if (client) {
         for (auto &gamepad : gamepads) {
+          // Stop DS4 output report polling threads
+          if (gamepad.ds4_feedback_stop_event) {
+            SetEvent(gamepad.ds4_feedback_stop_event);
+            if (gamepad.ds4_feedback_thread.joinable()) {
+              gamepad.ds4_feedback_thread.join();
+            }
+            CloseHandle(gamepad.ds4_feedback_stop_event);
+            gamepad.ds4_feedback_stop_event = nullptr;
+          }
+
           if (gamepad.gp && vigem_target_is_attached(gamepad.gp.get())) {
             auto status = vigem_target_remove(client.get(), gamepad.gp.get());
             if (!VIGEM_SUCCESS(status)) {
@@ -421,23 +440,73 @@ namespace platf {
     task_pool.push(&vigem_t::rumble, (vigem_t *) userdata, target, largeMotor, smallMotor);
   }
 
-  void CALLBACK ds4_notify(
-    client_t::pointer client,
-    target_t::pointer target,
-    std::uint8_t largeMotor,
-    std::uint8_t smallMotor,
-    DS4_LIGHTBAR_COLOR led_color,
-    void *userdata
-  ) {
-    BOOST_LOG(debug)
-      << "largeMotor: "sv << (int) largeMotor << std::endl
-      << "smallMotor: "sv << (int) smallMotor << std::endl
-      << "LED: "sv << util::hex(led_color.Red).to_string_view() << ' '
-      << util::hex(led_color.Green).to_string_view() << ' '
-      << util::hex(led_color.Blue).to_string_view() << std::endl;
+  /**
+   * @brief Polls for DS4 raw output reports from ViGEmBus.
+   * @details This replaces vigem_target_ds4_register_notification which has a bug
+   *          in ViGEmBus where the IOCTL incorrectly parses DS4 HID output reports,
+   *          causing rumble notifications to never fire after the initial connection.
+   *          See https://github.com/nefarius/ViGEmBus/issues/80
+   * @param vigem The global ViGEm context.
+   * @param gamepad_index The global gamepad index.
+   */
+  void ds4_output_report_thread(vigem_t *vigem, int gamepad_index) {
+    auto &gamepad = vigem->gamepads[gamepad_index];
+    HANDLE stopEvent = gamepad.ds4_feedback_stop_event;
 
-    task_pool.push(&vigem_t::rumble, (vigem_t *) userdata, target, largeMotor, smallMotor);
-    task_pool.push(&vigem_t::set_rgb_led, (vigem_t *) userdata, target, led_color.Red, led_color.Green, led_color.Blue);
+    BOOST_LOG(debug) << "DS4 output report thread started for gamepad "sv << gamepad_index;
+
+    while (WaitForSingleObject(stopEvent, 0) != WAIT_OBJECT_0) {
+      DS4_OUTPUT_BUFFER buffer {};
+
+      auto status = vigem_target_ds4_await_output_report_timeout(vigem->client.get(), gamepad.gp.get(), 100, &buffer);
+
+      if (status == VIGEM_ERROR_TIMED_OUT) {
+        continue;
+      }
+
+      if (!VIGEM_SUCCESS(status)) {
+        // Device was likely disconnected
+        BOOST_LOG(debug) << "DS4 output report thread exiting: ["sv << util::hex(status).to_string_view() << ']';
+        break;
+      }
+
+      // DS4 USB HID output report format:
+      // Byte 0: Report ID (0x05)
+      // Byte 1: Flags (0x01=motors, 0x02=LED, 0x04=flash)
+      // Byte 4: Small motor (right / high frequency)
+      // Byte 5: Large motor (left / low frequency)
+      // Byte 6: LED Red
+      // Byte 7: LED Green
+      // Byte 8: LED Blue
+      std::uint8_t flags = buffer.Buffer[1];
+      auto target = gamepad.gp.get();
+
+      if (flags & 0x01) {
+        std::uint8_t smallMotor = buffer.Buffer[4];
+        std::uint8_t largeMotor = buffer.Buffer[5];
+
+        BOOST_LOG(debug)
+          << "DS4 raw output: largeMotor: "sv << (int) largeMotor << std::endl
+          << "smallMotor: "sv << (int) smallMotor;
+
+        task_pool.push(&vigem_t::rumble, vigem, target, largeMotor, smallMotor);
+      }
+
+      if (flags & 0x02) {
+        std::uint8_t r = buffer.Buffer[6];
+        std::uint8_t g = buffer.Buffer[7];
+        std::uint8_t b = buffer.Buffer[8];
+
+        BOOST_LOG(debug)
+          << "DS4 raw output: LED: "sv << util::hex(r).to_string_view() << ' '
+          << util::hex(g).to_string_view() << ' '
+          << util::hex(b).to_string_view();
+
+        task_pool.push(&vigem_t::set_rgb_led, vigem, target, r, g, b);
+      }
+    }
+
+    BOOST_LOG(debug) << "DS4 output report thread stopped for gamepad "sv << gamepad_index;
   }
 
   struct input_raw_t {
